@@ -1,0 +1,145 @@
+---
+title: "Introduction"
+description: "jmp is a C++20 single-header library for static branches — conditions that are stable at runtime and can be changed with minimal overhead via code patching."
+---
+
+## What is a static branch?
+
+A branch is a conditional jump in your program — an `if` statement, a `switch`, or any expression that selects between two or more code paths. Most branches evaluate a condition at runtime every time they execute.
+
+A **static branch** is different: once set, it changes rarely. The condition is stable for long stretches of execution. The challenge is that the CPU and compiler still treat it like any other branch — comparing values, possibly missing in the branch predictor, and adding instruction-level overhead on every evaluation.
+
+`jmp` removes that overhead entirely. Instead of comparing a value at runtime, it uses **code patching** to rewrite the branch instruction in memory. The `nop` or `jmp` at the call site is physically swapped when the branch value changes, so the steady-state cost of evaluating the branch drops to a single instruction with no memory access.
+
+## The performance problem
+
+Consider a logging flag — enabled during development, disabled in production:
+
+```cpp
+bool logging_enabled = false;
+
+void process(Request& req) {
+  if (logging_enabled) {   // load + compare on every call
+    log(req);
+  }
+  handle(req);
+}
+```
+
+With a regular `bool`, the generated assembly always loads from memory and compares:
+
+```asm
+fn():
+  // dynamic_bool = false
+  cmp   byte ptr [rip + dynamic_bool], 1   ; memory load every call
+  je    .LBB0_1
+  lea   rdi, [rip + .L.str]
+  jmp   puts
+  .LBB0_1: push rax
+  call  __cxa_rethrow@PLT
+
+  // dynamic_bool = true  (same instructions — no change)
+  cmp   byte ptr [rip + dynamic_bool], 1   ; still loads from memory
+  je    .LBB0_1
+  ...
+```
+
+With `jmp::static_branch<bool>`, the condition becomes a single `nop` when false — and is patched to a `jmp` when true:
+
+```asm
+fn():
+  // static_bool = false
+  nop                      ; one instruction, no memory access
+
+  // static_bool = true  (code patched in memory)
+  jmp   .LBB0_1            ; one instruction, no memory access
+```
+
+This matters in tight loops or frequently-called hot paths where the branch is evaluated millions of times between changes.
+
+## Ideal use cases
+
+`jmp` is most effective when a branch meets one or more of these conditions:
+
+- **Stable through its lifecycle** — the value changes rarely relative to how often it is evaluated (logging flags, feature toggles, dispatch mode selectors)
+- **Expensive to compute or requires memory access** — loading a value from a distant cache line adds latency that accumulates
+- **Hard for the branch predictor to learn** — unpredictable access patterns prevent the CPU from speculating correctly
+
+Concrete examples from real systems:
+
+- **Logging and tracing** — enabled during debugging, disabled in production; evaluated on every request
+- **Dispatching** — selecting between implementations (e.g., `variant` type index, strategy pattern) where the active implementation changes infrequently
+- **Fast path / slow path** — normal execution takes the fast path; exceptional conditions activate the slow path
+
+## Before vs. after
+
+```cpp
+// Before: dynamic bool — memory load on every branch evaluation
+bool dynamic_bool = false;
+
+void fn() {
+  if (dynamic_bool) {
+    throw;
+  } else {
+    std::puts("else");
+  }
+}
+```
+
+```cpp
+// After: static branch — single nop or jmp, no memory access
+constexpr jmp::static_branch<bool> static_bool = false;
+
+void fn() {
+  if (static_bool) {
+    throw;
+  } else {
+    std::puts("else");
+  }
+}
+```
+
+The assembly difference makes the cost concrete:
+
+```asm
+// dynamic_bool — same instructions regardless of value
+fn() with dynamic_bool = false:
+  cmp   byte ptr [rip + dynamic_bool], 1   ; 2 uOps, 5 cycle latency
+  je    .LBB0_1
+  lea   rdi, [rip + .L.str]
+  jmp   puts
+
+// static_bool — patched in memory, zero runtime evaluation cost
+fn() with static_bool = false:
+  nop                                       ; 1 uOp, 0.25 cycle throughput
+  lea   rdi, [rip + .L.str]
+  jmp   puts
+
+fn() with static_bool = true:
+  jmp   .LBB0_1                             ; 1 uOp — branch is taken
+  lea   rdi, [rip + .L.str]
+  jmp   puts
+```
+
+## Key features
+
+- **Single header** — drop `jmp` into your project with no build system changes
+- **C++20 module** — available as `jmp.cppm` for module-based builds
+- **Minimal API** — two types (`static_branch<bool>`, `static_branch<T, Min, Max>`) and one setup function (`jmp::init()`)
+- **Self-verifying** — compile-time tests run on include; disable with `-DNTEST` if needed
+- **1 byte per instance** — `sizeof(static_branch<bool>) == 1`, `sizeof(static_branch<T, Min, Max>) == 1`
+
+## Requirements
+
+- C++20 — clang++ 10+ or g++ 10+
+- x86-64 architecture
+- Linux
+
+<CardGroup cols={2}>
+  <Card title="Quickstart" icon="rocket" href="/quickstart">
+    Install the header, declare your first static branch, and run a working example in minutes.
+  </Card>
+  <Card title="API reference" icon="book" href="/reference/api">
+    Full reference for `static_branch`, `jmp::init()`, constraints, and lifetime rules.
+  </Card>
+</CardGroup>

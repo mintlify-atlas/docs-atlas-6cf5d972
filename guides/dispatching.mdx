@@ -1,0 +1,386 @@
+---
+title: "Dispatching techniques"
+description: A side-by-side comparison of every common branch dispatch technique for bool and int, including the assembly each one generates.
+---
+
+This page compares every common technique for dispatching on a `bool` or an `int` value, showing the assembly each one generates and explaining its trade-offs. The helper functions used throughout are:
+
+```cpp
+auto f1() -> int { return 42; }
+auto f2() -> int { return 77; }
+auto f3() -> int { return 99; }
+```
+
+<Tabs>
+  <Tab title="bool dispatching">
+
+## Bool dispatching
+
+<Tabs>
+  <Tab title="if_else">
+
+```cpp
+auto if_else(bool b) -> int {
+  if (b) {
+    return f1();
+  } else {
+    return f2();
+  }
+}
+```
+
+```asm
+if_else(bool):
+  testl   %edi, %edi
+  movl    $42, %ecx
+  movl    $77, %eax
+  cmovnel %ecx, %eax   # cmove or cmp
+  retq
+```
+
+The compiler uses a conditional move (`cmovne`) — no branch, but requires evaluating both return values and performing the memory comparison.
+
+  </Tab>
+  <Tab title="if_else [[likely]]">
+
+```cpp
+auto if_else_likely(bool b) -> int {
+  if (b) [[likely]] {
+    return f1();
+  } else {
+    return f2();
+  }
+}
+```
+
+```asm
+if_else_likely(bool):
+  movl    $42, %eax    # likely
+  testl   %edi, %edi
+  je      .LBB3_1
+  retq
+.LBB3_1:
+  movl    $77, %eax
+  retq
+```
+
+`[[likely]]` changes the layout: the likely branch is the fall-through and the unlikely branch is a taken jump. This improves branch-predictor efficiency when the hint is accurate — but requires a real conditional jump.
+
+  </Tab>
+  <Tab title="ternary_op">
+
+```cpp
+auto ternary_op(bool b) -> int {
+  return b ? f1() : f2();
+}
+```
+
+```asm
+ternary_op(bool):
+  testl   %edi, %edi
+  movl    $42, %ecx
+  movl    $77, %eax
+  cmovnel %ecx, %eax   # often cmove
+  retq
+```
+
+Equivalent to `if_else` — the compiler emits the same `cmovne` pattern.
+
+  </Tab>
+  <Tab title="jump_table">
+
+```cpp
+auto jump_table(bool b) -> int {
+  static constexpr int (*dispatch[])(){
+    &f1, &f2
+  };
+  return dispatch[b]();
+}
+```
+
+```asm
+jump_table(bool):
+  movl    %edi, %eax
+  leaq    dispatch(%rip), %rcx
+  jmpq    *(%rcx,%rax,8)   # or call
+
+dispatch:
+  .quad   f1()
+  .quad   f2()
+```
+
+An indirect jump through a function-pointer table. The condition itself is gone, but the indirect jump requires loading the target address from memory (cache-dependent latency).
+
+  </Tab>
+  <Tab title="computed_goto">
+
+```cpp
+auto computed_goto(bool b) -> int {
+  static constexpr void* labels[]{&&L1, &&L2};
+  goto *labels[b];
+  L1: return f1();
+  L2: return f2();
+}
+```
+
+```asm
+computed_goto(bool):
+  movl    %edi, %eax
+  leaq    labels(%rip), %rcx
+  jmpq    *(%rcx,%rax,8)
+.Ltmp15:
+  movl    $42, %eax
+  retq
+.Ltmp17:
+  movl    $77, %eax
+  retq
+
+labels:
+  .quad   .Ltmp15
+  .quad   .Ltmp17
+```
+
+A GCC/Clang extension. Structurally identical to `jump_table` but labels targets within the same function — still an indirect jump through a label address table.
+
+  </Tab>
+  <Tab title="jmp::static_branch">
+
+```cpp
+jmp::static_branch<bool> branch = false;
+
+auto jmp() -> int {
+  if (branch) {
+    return f1();
+  } else {
+    return f2();
+  }
+}
+```
+
+```asm
+jmp():
+  nop|jmp .Ltmp1   # code patching
+.Ltmp0:
+  movl    $42, %eax
+  retq
+.Ltmp1:
+  movl    $77, %eax
+  retq
+```
+
+The instruction at the top is either a 5-byte `nop` (fast path) or a `jmp` (slow path). There is no condition check, no memory load, and no indirect jump — just a direct unconditional jump or nothing at all.
+
+  </Tab>
+</Tabs>
+
+### Bool summary
+
+| Technique | Key instruction | Condition check | Predictor pressure | Runtime change |
+|---|---|---|---|---|
+| `if_else` | `cmovne` | Yes (test) | Low (no branch) | Yes |
+| `if_else [[likely]]` | `je` / `jne` | Yes | Low (predictable) | Yes |
+| `ternary_op` | `cmovne` | Yes (test) | Low (no branch) | Yes |
+| `jump_table` | `jmpq *mem` | No | Medium (indirect) | Yes |
+| `computed_goto` | `jmpq *mem` | No | Medium (indirect) | Yes |
+| `jmp::static_branch` | `nop` or `jmp` | **None** | **None** | Yes (via code patch) |
+
+  </Tab>
+  <Tab title="int dispatching">
+
+## Int dispatching
+
+<Tabs>
+  <Tab title="if_else">
+
+```cpp
+auto if_else(int i) -> int {
+  [[assume(i >= 0 and i <= 2)]];
+  if (i == 0) {
+    return f1();
+  } else if (i == 1) {
+    return f2();
+  } else if (i == 2) {
+    return f3();
+  } else {
+    std::unreachable();
+  }
+}
+```
+
+```asm
+if_else(int):
+  cmpl    $1, %edi
+  movl    $77, %eax
+  movl    $99, %ecx
+  cmovel  %eax, %ecx
+  testl   %edi, %edi
+  movl    $42, %eax
+  cmovnel %ecx, %eax
+  retq
+```
+
+The compiler collapses the chain of comparisons into two `cmov` instructions. No branches, but requires multiple compare and move operations.
+
+  </Tab>
+  <Tab title="switch_case">
+
+```cpp
+auto switch_case(int i) -> int {
+  [[assume(i >= 0 and i <= 2)]];
+  switch (i) {
+    default: std::unreachable();
+    case 0: return f1();
+    case 1: return f2();
+    case 2: return f3();
+  }
+}
+```
+
+```asm
+switch_case(int):
+  movl    %edi, %eax
+  leaq    .Lswitch.table(%rip), %rcx
+  movl    (%rcx,%rax,4), %eax
+  retq
+
+.Lswitch.table(int):
+  .long   42
+  .long   77
+  .long   99
+```
+
+The compiler converts the switch to a value table lookup — one indexed load, no branch. Fast when the table is in cache.
+
+  </Tab>
+  <Tab title="jump_table">
+
+```cpp
+auto jump_table(int i) -> int {
+  [[assume(i >= 0 and i <= 2)]];
+  static constexpr int (*dispatch[])(int){
+    [](int) { return f1(); },
+    [](int) { return f2(); },
+    [](int) { return f3(); },
+  };
+  [[clang::musttail]] return dispatch[i](i);
+}
+```
+
+```asm
+jump_table(int):
+  movl    %edi, %eax
+  leaq    dispatch(%rip), %rcx
+  jmpq    *(%rcx,%rax,8)   # always jmp
+
+dispatch:
+  .quad   f1()
+  .quad   f2()
+  .quad   f3()
+```
+
+`[[clang::musttail]]` forces a tail-call, turning the indirect call into a direct indirect jump. One load + one indirect jump; no return.
+
+  </Tab>
+  <Tab title="computed_goto">
+
+```cpp
+auto computed_goto(int i) -> int {
+  [[assume(i >= 0 and i <= 2)]];
+  static constexpr void* labels[]{
+    &&L1, &&L2, &&L3
+  };
+  goto *labels[i];
+  L1: return f1();
+  L2: return f2();
+  L3: return f3();
+}
+```
+
+```asm
+computed_goto(int):
+  movl    %edi, %eax
+  leaq    labels(%rip), %rcx
+  jmpq    *(%rcx,%rax,8)
+.Ltmp35:
+  movl    $42, %eax
+  retq
+.Ltmp37:
+  movl    $99, %eax
+  retq
+.Ltmp39:
+  movl    $77, %eax
+  retq
+
+labels:
+  .quad   .Ltmp35
+  .quad   .Ltmp37
+  .quad   .Ltmp39
+```
+
+Same structure as the function-pointer jump table but with label addresses. One indirect jump; the targets are in the same function body.
+
+  </Tab>
+  <Tab title="jmp::static_branch">
+
+```cpp
+jmp::static_branch<int, 0, 2> branch = 0;
+
+auto jmp() -> int {
+  switch (branch) {
+    default: std::unreachable();
+    case 0: return f1();
+    case 1: return f2();
+    case 2: return f3();
+  }
+}
+```
+
+```asm
+jmp():
+  jmp .LBB21_0|.LBB21_1|.LBB21_2   # code patching
+.LBB21_0:
+  movl    $42, %eax
+  retq
+.LBB21_1:
+  movl    $99, %eax
+  retq
+.LBB21_2:
+  movl    $77, %eax
+  retq
+```
+
+The first instruction is a direct unconditional `jmp` patched to one of three targets. No index load, no indirect jump, no comparison — just a single direct jump to the right case.
+
+  </Tab>
+</Tabs>
+
+### Int summary
+
+| Technique | Key instruction | Condition check | Predictor pressure | Runtime change |
+|---|---|---|---|---|
+| `if_else` | `cmov` × 2 | Yes (cmp) | Low (no branch) | Yes |
+| `switch_case` | indexed load | No | None | Yes |
+| `jump_table` | `jmpq *mem` | No | Medium (indirect) | Yes |
+| `computed_goto` | `jmpq *mem` | No | Medium (indirect) | Yes |
+| `jmp::static_branch` | `jmp label` | **None** | **None** | Yes (via code patch) |
+
+  </Tab>
+</Tabs>
+
+<Note>
+`jmp::static_branch` is the only technique that eliminates the condition check entirely. All other techniques — including `[[likely]]`, jump tables, and computed gotos — still require either a comparison instruction or an indirect memory access at the call site. `static_branch` moves the "check" out of the hot path and into the code-patching write that happens only when the branch value changes.
+</Note>
+
+---
+
+<CardGroup cols={3}>
+  <Card title="Use cases" icon="lightbulb" href="/guides/use-cases">
+    When to reach for static_branch vs a plain bool.
+  </Card>
+  <Card title="Fast/slow path" icon="gauge-high" href="/guides/fast-slow-path">
+    See the fast/slow path pattern with assembly walkthrough.
+  </Card>
+  <Card title="Variant with static dispatch" icon="layer-group" href="/guides/variant-example">
+    A full variant class built on static_branch.
+  </Card>
+</CardGroup>

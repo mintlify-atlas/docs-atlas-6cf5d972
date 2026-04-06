@@ -1,0 +1,134 @@
+---
+title: "Further reading"
+description: "Reference materials for understanding the techniques behind jmp — from Linux kernel internals to x86-64 microarchitecture and inline assembly."
+---
+
+## Linux kernel implementation
+
+The foundational technique `jmp` is built on. The kernel's static key mechanism
+uses the same `asm goto` + ELF section + `text_poke` pattern on multiple
+architectures.
+
+<CardGroup cols={1}>
+  <Card
+    title="Linux static keys"
+    icon="linux"
+    href="https://docs.kernel.org/staging/static-keys.html"
+  >
+    The authoritative documentation for Linux static keys. Covers the design
+    rationale, the `jump_label` infrastructure, and architecture-specific
+    implementations on x86, ARM64, s390, and others. Essential context for
+    understanding why `jmp` works the way it does and how the technique can be
+    extended to other platforms.
+  </Card>
+</CardGroup>
+
+---
+
+## x86-64 architecture
+
+References for the specific instructions `jmp` relies on — the 5-byte multi-byte
+`nop`, the near `jmp rel32`, and the performance characteristics of both.
+
+<CardGroup cols={2}>
+  <Card
+    title="Intel Software Developer's Manual"
+    icon="microchip"
+    href="https://www.intel.com/content/www/us/en/developer/articles/technical/intel-sdm.html"
+  >
+    The complete x86-64 instruction set reference from Intel. Covers instruction
+    encodings, operand sizes, and latency guidance. Use vol. 2 for the `NOP` and
+    `JMP` instruction entries that describe the exact byte sequences `jmp` patches.
+  </Card>
+  <Card
+    title="x86 instruction tables"
+    icon="table"
+    href="https://www.agner.org/optimize/instruction_tables.pdf"
+  >
+    Agner Fog's instruction timing tables for Intel and AMD microarchitectures.
+    Provides latency, throughput, and port usage for every instruction on recent
+    CPUs. Useful for quantifying the execution cost difference between a `nop`,
+    a `jmp`, a `cmp`/`je` pair, and other dispatch alternatives.
+  </Card>
+  <Card
+    title="x86 instruction reference"
+    icon="book"
+    href="https://www.felixcloutier.com/x86"
+  >
+    A clean, searchable HTML rendering of the Intel SDM instruction reference.
+    Look up `NOP` for the multi-byte encodings used by `jmp` (`0F 1F /0`) and
+    `JMP` for the near relative form (`E9 cd`).
+  </Card>
+  <Card
+    title="uops.info — latency, throughput, and port usage"
+    icon="chart-bar"
+    href="https://uops.info/table.html"
+  >
+    Empirically measured microarchitectural data for x86-64 instructions across
+    Intel, AMD, and Zhaoxin CPUs. Complements Agner Fog's tables with
+    machine-generated measurements. The performance comparison tables in the
+    `jmp` overview are annotated with uops.info columns.
+  </Card>
+</CardGroup>
+
+---
+
+## GCC inline assembly
+
+`jmp` is implemented using extended `asm goto` — GCC's extension for inline
+assembly with output label operands. These references explain the syntax and
+constraints used in the `operator bool()` and `operator T()` implementations.
+
+<CardGroup cols={2}>
+  <Card
+    title="GCC extended asm"
+    icon="code"
+    href="https://gcc.gnu.org/onlinedocs/gcc/Extended-Asm.html"
+  >
+    The GCC manual section on extended inline assembly. Covers output operands,
+    input operands, clobbers, and the `goto` form with output labels. The
+    `asm volatile goto(...) : : : : label` syntax used throughout `jmp` is
+    documented here, including the rules for label operands and `volatile`
+    semantics.
+  </Card>
+  <Card
+    title="GCC assembler syntax"
+    icon="terminal"
+    href="https://www.felixcloutier.com/documents/gcc-asm.html"
+  >
+    A concise reference for GCC's AT&T assembler syntax and constraint codes.
+    Covers the `%c` immediate constraint used in `jmp`'s `.pushsection`/`.popsection`
+    directives to embed compile-time constants (instruction bytes, entry sizes,
+    `this` pointers) into the `__jmp` ELF section at object-file generation time.
+  </Card>
+</CardGroup>
+
+---
+
+## Research papers
+
+Academic work on the broader techniques `jmp` belongs to.
+
+<CardGroup cols={2}>
+  <Card
+    title="Copy-and-patch compilation"
+    icon="file-lines"
+    href="https://arxiv.org/abs/2308.14185"
+  >
+    Describes a JIT compilation strategy that reuses pre-compiled code templates
+    by patching relocations at runtime — a generalisation of the code patching
+    idea at the core of `jmp`. Relevant background for understanding when and why
+    runtime code modification is a practical performance technique.
+  </Card>
+  <Card
+    title="Semi-static conditions in low-latency C++ for high-frequency trading"
+    icon="file-lines"
+    href="https://arxiv.org/abs/2011.13127"
+  >
+    Examines the performance of different branching strategies in latency-critical
+    C++ systems, including conditions that are stable for long periods but must
+    occasionally change at runtime. Provides motivation and benchmarks for
+    approaches like `jmp`'s static branches, and discusses the trade-offs between
+    branch predictor training, code patching, and other techniques.
+  </Card>
+</CardGroup>

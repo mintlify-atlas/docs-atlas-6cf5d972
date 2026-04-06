@@ -1,0 +1,284 @@
+---
+title: "API reference"
+description: "Complete reference for all public types and functions in the jmp static branch library."
+---
+
+## `jmp::static_branch<bool>`
+
+A minimal-overhead boolean static branch changed at runtime via code patching. The branch value starts as `false` (a `nop` instruction) and is switched to `true` (a `jmp` instruction) by assigning to it after calling `jmp::init()`.
+
+```cpp
+constexpr jmp::static_branch<bool> enabled = false;
+
+void fn() {
+  if (enabled) {
+    std::puts("enabled");
+  } else {
+    std::puts("disabled");
+  }
+}
+```
+
+<Warning>
+  The initial value **must** be `false`. Passing `true` to the constructor calls an
+  undefined `failed()` function at compile time, producing a hard error.
+</Warning>
+
+<Note>
+  `sizeof(jmp::static_branch<bool>) == 1`. The object occupies exactly one byte.
+  Copy and move construction and assignment are deleted — declare as `constexpr` at
+  namespace or class scope (global lifetime required).
+</Note>
+
+### Constructor
+
+<ParamField path="value" type="bool" required default="false">
+  Initial branch value. Must be `false`. Passing `true` is a compile-time error.
+</ParamField>
+
+```cpp
+constexpr explicit(false) static_branch(const bool value) noexcept;
+```
+
+The `explicit(false)` specifier permits implicit construction from a `bool` literal, enabling the idiomatic `constexpr jmp::static_branch<bool> flag = false;` syntax.
+
+### Deleted special members
+
+Copy construction, move construction, copy assignment, and move assignment are all deleted. The object must have static storage duration and must not be copied or moved.
+
+```cpp
+constexpr static_branch(const static_branch&) noexcept = delete;
+constexpr static_branch(static_branch&&) noexcept = delete;
+constexpr static_branch& operator=(const static_branch&) noexcept = delete;
+constexpr static_branch& operator=(static_branch&&) noexcept = delete;
+```
+
+### `operator=(bool)`
+
+Updates the branch value via code patching. Iterates the `__jmp` ELF section and overwrites each inlined instance with either a 5-byte `nop` (value `false`) or a 5-byte `jmp` to the true-branch label (value `true`).
+
+```cpp
+constexpr const auto& operator=(const bool value) const noexcept;
+```
+
+<ParamField path="value" type="bool" required>
+  New branch value. `false` patches to `nop`; `true` patches to `jmp`.
+</ParamField>
+
+<Warning>
+  `jmp::init()` must be called before the first assignment. Without it, the code
+  pages are read-only; writing to them via `operator=` will cause a segfault (SIGSEGV).
+</Warning>
+
+```cpp
+int main() {
+  if (not jmp::init()) {
+    return errno;
+  }
+
+  fn(); // executes the false branch
+
+  enabled = true;
+  fn(); // executes the true branch
+
+  enabled = false;
+  fn(); // back to the false branch
+}
+```
+
+### `operator bool()`
+
+Reads the current branch value. Decorated with `[[gnu::always_inline]]` and `[[nodiscard]]` to ensure the branch is inlined and the result is not discarded.
+
+```cpp
+[[gnu::always_inline]] [[nodiscard]]
+inline explicit(false) operator bool() const noexcept;
+```
+
+At the call site the compiler emits a 5-byte `nop` (or `jmp`) directly into the instruction stream via `asm goto`. There is no memory load — the branch is encoded in the instruction itself.
+
+---
+
+## `jmp::static_branch<T, T Min, T Max>`
+
+A minimal-overhead integer static branch over a contiguous range `[Min, Max]`, changed at runtime via code patching. Switching patches the 4-byte relative offset of an existing `jmp` instruction to redirect execution to the corresponding case label.
+
+```cpp
+constexpr jmp::static_branch<int, 0, 2> mode = 0;
+
+void fn() {
+  switch (mode) {
+    default: std::unreachable();
+    case 0: std::puts("mode 0"); return;
+    case 1: std::puts("mode 1"); return;
+    case 2: std::puts("mode 2"); return;
+  }
+}
+```
+
+<Warning>
+  The initial value **must** be `Min`. Passing any other value calls `failed()` at
+  compile time.
+</Warning>
+
+<Note>
+  `sizeof(jmp::static_branch<T, Min, Max>) == 1`. The range width `Max - Min`
+  must satisfy `2 ≤ (Max - Min) ≤ 7`. The type `T` must support
+  `reinterpret_cast<T>(t)` (i.e., integer or pointer types, not floating point).
+</Note>
+
+### Template parameters
+
+| Parameter | Description |
+|-----------|-------------|
+| `T`       | Value type. Must satisfy `requires(T t) { reinterpret_cast<T>(t); }`. Integer types (`int`, `unsigned`, `size_t`, etc.) qualify. |
+| `Min`     | Inclusive lower bound of the valid range. Also the required initial value. |
+| `Max`     | Inclusive upper bound. `Max - Min` must be between 2 and 7 inclusive. |
+
+### Constraint
+
+```cpp
+template<class T, T Min, T Max>
+  requires requires(T t) { reinterpret_cast<T>(t); } and
+  (Max - Min >= 2 and Max - Min <= 7)
+struct static_branch<T, Min, Max> final { ... };
+```
+
+### Constructor
+
+<ParamField path="value" type="T" required>
+  Initial branch value. Must equal `Min`. Any other value is a compile-time error.
+</ParamField>
+
+```cpp
+constexpr explicit(false) static_branch(const T value) noexcept;
+```
+
+### Deleted special members
+
+Identical to the `bool` specialisation — copy and move are deleted.
+
+### `operator=(T)`
+
+Updates the branch by patching the 4-byte relative offset of the `jmp` instruction in every inlined instance to redirect to the label for the new value.
+
+```cpp
+constexpr const auto& operator=(const T value) const noexcept;
+```
+
+<ParamField path="value" type="T" required>
+  New branch value. Must be in `[Min, Max]`.
+</ParamField>
+
+```cpp
+int main() {
+  if (not jmp::init()) {
+    return errno;
+  }
+
+  fn(); // mode 0
+
+  mode = 1;
+  fn(); // mode 1
+
+  mode = 2;
+  fn(); // mode 2
+}
+```
+
+### `operator T()`
+
+Reads the current branch value via `asm goto`. Decorated with `[[gnu::always_inline]]` and `[[nodiscard]]`.
+
+```cpp
+[[gnu::always_inline]] [[nodiscard]]
+inline explicit(false) operator T() const noexcept;
+```
+
+The compiler emits a single `jmp` instruction whose 4-byte offset is patched at runtime to jump directly to the correct case label. There is no comparison, no table lookup, and no memory load.
+
+---
+
+## `jmp::init()`
+
+Makes code pages writable so that branch values can be patched at runtime. Iterates every entry in the `__jmp` ELF section and calls `mprotect` on the page containing each branch site.
+
+```cpp
+[[nodiscard]] static inline auto init(
+  const u64 page_size   = getpagesize(),
+  const u64 permissions = 0b111          // PROT_READ | PROT_WRITE | PROT_EXEC
+) noexcept -> bool;
+```
+
+<Warning>
+  Must be called **before** any branch value assignment (`branch = ...`). Call it
+  once at program startup, typically at the top of `main()`.
+</Warning>
+
+### Parameters
+
+<ParamField path="page_size" type="uint64_t" default="getpagesize()">
+  Page size used to align `mprotect` calls. Defaults to the system page size from
+  `getpagesize()`. Override only when working with huge pages.
+</ParamField>
+
+<ParamField path="permissions" type="uint64_t" default="0b111">
+  Memory protection flags passed to `mprotect`. Default is
+  `PROT_READ | PROT_WRITE | PROT_EXEC` (`0b111`). Changing this may prevent future
+  patching or execution.
+</ParamField>
+
+### Return value
+
+<ResponseField name="result" type="bool" required>
+  `true` if all `mprotect` calls succeeded. `false` if any call failed; `errno` is
+  set by the failing `mprotect` call to indicate the error.
+</ResponseField>
+
+```cpp
+int main() {
+  if (not jmp::init()) {
+    std::perror("jmp::init");
+    return errno;
+  }
+
+  // safe to assign branch values from here
+}
+```
+
+---
+
+## `jmp::test()`
+
+Runs the library's built-in compile-time and runtime self-tests. Verifies that `static_branch<bool>` and `static_branch<int, 0, 2>` behave correctly on the current compiler and environment.
+
+```cpp
+inline auto test() -> void; // in namespace jmp::inline v5_0_4
+```
+
+<Note>
+  `test()` is called automatically when the header is included, unless `-DNTEST` is
+  defined. You do not normally need to call it explicitly.
+</Note>
+
+The compile-time portion uses `static_assert` to verify:
+
+- `sizeof(static_branch<bool>) == 1`
+- `sizeof(static_branch<T, Min, Max>) == 1` for several type/range combinations
+- Copy/move construction is deleted
+
+The runtime portion calls `jmp::init()` and exercises both `static_branch<bool>` and `static_branch<int, 0, 2>`, asserting expected return values after each assignment.
+
+```cpp
+// Automatic on include (without -DNTEST):
+#include "jmp"
+
+// Equivalent manual call:
+jmp::test();
+```
+
+<Warning>
+  Compiling with `-DNTEST` suppresses all `static_assert` checks. Use with caution:
+  there are then no guarantees that the library works correctly with your
+  compiler and environment.
+</Warning>

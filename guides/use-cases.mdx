@@ -1,0 +1,74 @@
+---
+title: "Use cases"
+description: When to reach for jmp::static_branch vs a plain bool, and when to leave it alone.
+---
+
+`jmp::static_branch` is not a drop-in replacement for every `bool` or integer flag. It is a specialised tool for a specific class of problem. Use it when all three of the following conditions align — and avoid it when they do not.
+
+## The three ideal conditions
+
+<Steps>
+  <Step title="The branch is relatively stable through its life cycle">
+    The branch value is set once at startup (or changes very rarely at runtime) and then read in a hot loop millions of times. Logging enable/disable flags, feature toggles, and dispatch modes are classic examples.
+
+    If your flag changes on every request, every frame, or every iteration, `static_branch` is the wrong tool.
+  </Step>
+  <Step title="The branch is expensive to compute or requires a memory access">
+    A plain `bool dynamic_flag` still requires a `cmp` + memory load on each evaluation — even if the branch predictor guesses right. `static_branch` eliminates the load entirely: the check is baked into the instruction stream as either a `nop` (not taken) or a `jmp` (taken), with no runtime comparison instruction at all.
+
+    The benefit is largest on cache-cold code paths and in tight loops where every extra uop counts.
+  </Step>
+  <Step title="The branch is hard to learn by the branch predictor">
+    Some flags flip unpredictably — not correlated with input data, call site, or recent history. Hardware branch predictors struggle with these and generate frequent mispredictions. Because `static_branch` patches the instruction stream rather than using a conditional branch, there is simply no conditional branch for the predictor to mispredict.
+  </Step>
+</Steps>
+
+## Concrete use cases
+
+| Scenario | Why `static_branch` helps |
+|---|---|
+| **Logging / tracing** | Log statements are checked on every call path. The flag is almost always `false`. A `nop` is cheaper than a branch that the predictor must track. |
+| **Dispatching** | Selecting between a small set of strategies (e.g. codec, serialiser, allocator) that is chosen at startup and never changes. |
+| **Fast path / kill switch** | Normal execution hits a `nop`. An operator intervention patches in a `jmp` to a slower diagnostic or fallback path. |
+| **Devirtualization** | Replace a virtual dispatch with a `static_branch<std::size_t, 0, N>` to jump directly to the right implementation with no vtable load. |
+| **Feature flags** | A feature is enabled once at process start based on a config file. The flag never flips during the run. |
+| **Debug probes** | Instrumentation that is compiled in but disabled at `nop` cost in production, and can be activated at runtime without redeployment. |
+
+## When NOT to use `static_branch`
+
+<Warning>
+Do not use `static_branch` for conditions that change frequently at runtime.
+
+The cost of switching the branch is proportional to the number of inlined call sites: each switch is `N` × `memcpy` of 5 bytes (for `static_branch<bool>`) or 4 bytes (for `static_branch<T, Min, Max>`). If your flag changes on every request or in a tight loop, this switching overhead will dominate and you will be worse off than a plain `bool`.
+</Warning>
+
+A `bool dynamic_flag` is the right choice when:
+
+- The condition changes frequently (per-request, per-iteration).
+- The branch predictor already learns the pattern reliably (e.g. a flag that is `true` 99% of the time in a predictable way).
+- You are targeting a platform other than x86-64 Linux (see [requirements](/reference/requirements)).
+
+## Quick comparison
+
+| Property | `static_branch` | `bool` |
+|---|---|---|
+| Runtime condition check | None (nop or jmp) | `cmp` + memory load |
+| Branch predictor pressure | None | Present |
+| Switch cost | N × memcpy (5 bytes) | Write to memory |
+| Suitable for hot loops | Yes | Depends on predictor |
+| Suitable for frequent changes | No | Yes |
+| Platform requirement | x86-64 Linux | Any |
+
+---
+
+<CardGroup cols={3}>
+  <Card title="Fast/slow path" icon="gauge-high" href="/guides/fast-slow-path">
+    See the fast/slow path pattern with assembly walkthrough.
+  </Card>
+  <Card title="Dispatching techniques" icon="code-branch" href="/guides/dispatching">
+    Compare all branch dispatch techniques side by side.
+  </Card>
+  <Card title="Variant with static dispatch" icon="layer-group" href="/guides/variant-example">
+    A full variant class built on static_branch.
+  </Card>
+</CardGroup>

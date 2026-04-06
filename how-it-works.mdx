@@ -1,0 +1,134 @@
+---
+title: "How it works"
+description: "A detailed look at the code-patching mechanism behind jmp static branches — from ELF section layout to mprotect and runtime instruction rewriting."
+---
+
+`jmp` uses a technique called **code patching**: the program modifies its own executable instructions in memory at runtime. This is the same mechanism used by the Linux kernel's [static keys](https://docs.kernel.org/staging/static-keys.html), adapted for userspace C++20.
+
+## The core idea
+
+When you write `if (b)` where `b` is a `jmp::static_branch<bool>`, the compiler does not emit a `cmp` + conditional jump. Instead, it emits a **5-byte `nop`** at the branch site and records the location of that `nop` in a dedicated ELF section called `__jmp`.
+
+When you later assign `b = true`, the library walks the `__jmp` section, finds every site where `b` is used, and **overwrites those 5 bytes** in the program's code pages — replacing the `nop` with a `jmp` to the true-branch label. The reverse happens when you assign `b = false`.
+
+No compare. No memory load. Just a single instruction at the call site.
+
+## Step-by-step walkthrough
+
+Consider this code:
+
+```cpp
+constexpr jmp::static_branch<bool> b = false;
+
+if (b) {
+  return 42;
+} else {
+  return 0;
+}
+```
+
+### Step 1: The compiler emits a nop
+
+The `if (b)` expression uses `asm goto` to emit a 5-byte multi-byte `nop` (opcode `0f 1f 44 00 00`):
+
+```asm
+main:
+  .byte 0f 1f 44 00 00   ; 5-byte nop
+.LBB0:
+  xor eax, eax           ; return 0
+  ret
+.LBB1:
+  mov eax, 42            ; return 42
+  ret
+```
+
+The branch has two labels: `.LBB0` (the false path, immediately after the nop) and `.LBB1` (the true path, elsewhere in the function).
+
+### Step 2: What executes when the branch is false
+
+At startup, `b` is `false`. Execution falls through the `nop` and continues to `.LBB0`:
+
+```asm
+main:
+  nop                    ; does nothing, falls through
+  xor eax, eax           ; return 0
+  ret
+```
+
+No comparison. No branch predictor involved. The CPU executes one harmless instruction and moves on.
+
+### Step 3: Patching when the branch is set to true
+
+When you call `b = true`, the `operator=` implementation walks the `__jmp` ELF section, finds all sites registered for this `b` instance, and overwrites the 5-byte `nop` with a 5-byte near `jmp` pointing to `.LBB1`:
+
+```asm
+main:
+  call b.operator=(true) ; nop bytes overwritten with jmp .LBB1
+
+  jmp .LBB1              ; patched in memory — was nop
+.LBB0:
+  xor eax, eax           ; return 0
+  ret
+.LBB1:
+  mov eax, 42            ; return 42
+  ret
+```
+
+From this point forward, every evaluation of `if (b)` executes the `jmp` and takes the true branch — with no runtime condition evaluation.
+
+### Step 4: Patching back to false
+
+Assigning `b = false` repeats the process in reverse: the 5 bytes of the `jmp` are overwritten with the original 5-byte `nop`. The false path becomes the default again.
+
+## The `__jmp` ELF section
+
+Each use of a `static_branch` in a function emits an **entry struct** into the `__jmp` ELF section. For `static_branch<bool>`, each entry contains:
+
+| Field     | Type       | Contents                                              |
+| --------- | ---------- | ----------------------------------------------------- |
+| `size`    | `uint64_t` | Size of this entry struct (for iteration)             |
+| `code`    | `void*`    | Pointer to the `nop`/`jmp` bytes in the code segment  |
+| `len`     | `uint64_t` | Length of the instruction to patch (5 bytes for bool) |
+| `self`    | `const void*` | Identity of the `static_branch` object             |
+| `offsets` | `uint32_t[2]` | Relative jump offsets for false (0) and true (1)   |
+
+The `__start___jmp` and `__stop___jmp` linker symbols mark the boundaries of this section, allowing `jmp::init()` and `operator=` to iterate over all entries with a simple pointer walk.
+
+For `static_branch<T, Min, Max>`, the entry holds `(Max - Min + 1)` offsets — one per case value — rather than a `nop`/`jmp` pair. The `operator=` call directly writes the appropriate 4-byte offset into the `jmp` instruction's operand field.
+
+## `jmp::init()` and `mprotect`
+
+Code pages in a Linux process are mapped read+execute but not writable by default. Patching requires write permission.
+
+`jmp::init()` iterates over all entries in `__jmp` and calls `mprotect` on each corresponding code page, granting `PROT_READ | PROT_WRITE | PROT_EXEC` (`0b111`). This must be called **once before any branch assignment**.
+
+```cpp
+[[nodiscard]] static inline auto init(
+    const u64 page_size = getpagesize(),
+    const u64 permissions = 0b111) noexcept -> bool;
+```
+
+If `mprotect` fails for any page, `init()` returns `false` and sets `errno`. Calling `operator=` before `init()` is undefined behavior.
+
+## Cost of switching a branch
+
+Switching a `static_branch` is not free, but the cost is bounded and predictable:
+
+```
+cost = number of inlined instances × memcpy(patch_size)
+```
+
+- `static_branch<bool>`: 5 bytes per inlined instance (full `nop`/`jmp` replacement)
+- `static_branch<T, Min, Max>`: 4 bytes per inlined instance (only the `jmp` offset is rewritten)
+
+If the function using the branch is marked `[[gnu::noinline]]`, there is exactly one instance — so switching costs one `memcpy`. If the function is inlined at N call sites, the cost is N `memcpy` calls. For branches that change rarely and are evaluated constantly, this tradeoff is almost always favorable.
+
+## `asm goto` requirement
+
+The code-patching trick relies on GCC's `asm goto` extension, which lets inline assembly transfer control to C++ labels. Both clang and GCC support this. MSVC does not, so `jmp` requires clang 10+ or GCC 10+.
+
+The `asm volatile goto` in `operator bool()` emits the `nop` bytes, pushes the entry into `__jmp`, and declares `_true` as a reachable label — all without the compiler generating an actual conditional branch instruction.
+
+## Linux kernel lineage
+
+This technique was pioneered in the Linux kernel as [static keys](https://docs.kernel.org/staging/static-keys.html). The kernel uses the same `nop`/`jmp` patching approach for features like tracepoints, performance counters, and scheduler hooks — conditions that are almost always false in production but must be evaluated in tight loops. `jmp` brings the same mechanism to userspace C++20 with a type-safe API.

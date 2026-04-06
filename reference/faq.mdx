@@ -1,0 +1,217 @@
+---
+title: "FAQ"
+description: "Frequently asked questions about jmp's design, behaviour, and usage."
+---
+
+<AccordionGroup>
+
+  <Accordion title="How does it work?">
+    `jmp` uses a technique called **code patching** — the program modifies its own
+    machine code at runtime. It is based on the same mechanism as
+    [Linux static keys](https://docs.kernel.org/staging/static-keys.html) and
+    requires `asm goto` support (available in both gcc and clang).
+
+    The key insight is that a branch site is encoded directly in the instruction
+    stream as either a `nop` (branch not taken) or a `jmp` (branch taken), rather
+    than as a comparison and conditional jump that must be evaluated at each call.
+
+    **Walkthrough**
+
+    Given:
+
+    ```cpp
+    constexpr jmp::static_branch<bool> b = false;
+
+    if (b) {
+      return 42;
+    } else {
+      return 0;
+    }
+    ```
+
+    The compiler emits:
+
+    ```text
+    main:
+      .byte 0x0f, 0x1f, 0x44, 0x00, 0x00  ; 5-byte nop
+    .LBB0:
+      xor eax, eax   ; return 0
+      ret
+    .LBB1:
+      mov eax, 42    ; return 42
+      ret
+    ```
+
+    The `nop` occupies exactly 5 bytes — the same width as a near `jmp rel32`
+    instruction. Both branches are present in the binary; the `nop` simply falls
+    through to the false branch.
+
+    Execution with `b == false` follows the `nop` and falls through to `.LBB0`.
+
+    When `b = true` is called, `operator=` iterates the `__jmp` ELF section,
+    finds every inlined instance of this branch, and overwrites the 5-byte `nop`
+    with a 5-byte `jmp .LBB1` using `memcpy`. Subsequent calls skip `.LBB0`
+    entirely and jump directly to `.LBB1`.
+
+    ```text
+    main:
+      call b.operator=(true)    ; patches nop -> jmp .LBB1
+
+      jmp .LBB1                 ; (nop was here; now a jmp)
+    .LBB0:
+      xor eax, eax
+      ret
+    .LBB1:
+      mov eax, 42
+      ret
+    ```
+
+    For `static_branch<T, Min, Max>`, the initial instruction is already a `jmp`
+    pointing at the `Min` label. Switching patches only the 4-byte relative offset,
+    redirecting the jump to the appropriate case label without changing the opcode.
+
+    The metadata needed for patching (code address, instruction length, `jmp`
+    offsets to each label) is stored in the `__jmp` ELF section as a compact
+    `entry<N>` struct emitted by the inline assembler alongside every branch site.
+  </Accordion>
+
+  <Accordion title="What platforms are supported?">
+    Only **x86-64 Linux** is currently supported.
+
+    The technique itself is architecture-neutral — the Linux kernel uses the same
+    approach on ARM64, s390, and other platforms. Support for additional
+    architectures can be added by providing the appropriate instruction encodings
+    and section metadata format. See the
+    [Linux static keys documentation](https://docs.kernel.org/staging/static-keys.html)
+    for a reference implementation covering multiple architectures.
+
+    The Linux requirement comes from the use of ELF sections (`__jmp`) and
+    `mprotect`. A Windows or macOS port would require replacing these with
+    platform-equivalent mechanisms.
+  </Accordion>
+
+  <Accordion title="What is the cost of switching the branch?">
+    Switching cost is proportional to the number of inlined instances:
+
+    ```text
+    cost = N × memcpy(5 bytes)   ; for static_branch<bool>
+    cost = N × memcpy(4 bytes)   ; for static_branch<T, Min, Max>
+    ```
+
+    Where `N` is the number of times the branch site was inlined by the compiler.
+
+    If the function containing the branch is marked `[[gnu::noinline]]`, there is
+    exactly one copy in the binary and switching costs a **single `memcpy`** of
+    4 or 5 bytes — essentially free.
+
+    For inlined functions, the compiler may duplicate the branch site once per
+    call site. `operator=` iterates the `__jmp` section and patches all copies in
+    a single pass, so the cost scales linearly with inline depth.
+
+    The **execution cost** after switching is zero beyond the single
+    `nop` or `jmp` instruction: there is no compare, no load, no branch
+    predictor involvement.
+
+    ```cpp
+    // Minimise switching cost: use noinline at the boundary
+    [[gnu::noinline]] void hot_path() {
+      if (flag) { ... } // single copy -> single memcpy to switch
+    }
+    ```
+  </Accordion>
+
+  <Accordion title="How do I disable running tests at compile time?">
+    Define `-DNTEST` before including the header (or pass it as a compiler flag):
+
+    ```bash
+    clang++ -std=c++20 -O2 -DNTEST main.cpp -o main
+    ```
+
+    When `NTEST` is defined, the `static_assert` checks and runtime self-tests
+    inside `jmp::test()` are compiled out entirely.
+
+    <Warning>
+      Use with caution. Disabling tests removes the guarantee that `jmp` works
+      correctly with your specific compiler version and environment. The tests are
+      lightweight and have no impact on production binary size or runtime
+      performance of your own code.
+    </Warning>
+  </Accordion>
+
+  <Accordion title="Can I use static_branch with local variables?">
+    No. `jmp::static_branch` objects must have **static storage duration** (i.e.,
+    declared at namespace scope, class scope, or as `static` locals). They must
+    not be declared as automatic (stack) variables.
+
+    The `__jmp` ELF section records a pointer to each branch object (`entry::self`)
+    so that `operator=` can locate all inlined instances belonging to that object.
+    This pointer must remain valid for the lifetime of the program.
+
+    The constructor will compile for local variables, but the behaviour is
+    undefined — the object will be destroyed when the enclosing scope exits while
+    patched entries in the `__jmp` section still reference it.
+
+    ```cpp
+    // Correct: namespace scope
+    constexpr jmp::static_branch<bool> flag = false;
+
+    // Correct: static local
+    void fn() {
+      static constexpr jmp::static_branch<bool> flag = false;
+      if (flag) { ... }
+    }
+
+    // Wrong: automatic storage — do not do this
+    void fn() {
+      jmp::static_branch<bool> flag = false; // undefined behaviour
+      if (flag) { ... }
+    }
+    ```
+  </Accordion>
+
+  <Accordion title="Can I use static_branch in multithreaded code?">
+    With care. Switching is implemented as a `memcpy` of 4 or 5 bytes and is
+    **not atomic**. A thread that reads the branch site (executes the `nop`/`jmp`
+    instruction) concurrently with a thread that is writing it (patching) may
+    observe a partially written instruction, which can cause undefined behaviour
+    at the CPU level.
+
+    Design your application so that branch switching happens at **safe points** —
+    for example:
+
+    - At program startup, before worker threads are launched.
+    - During a quiescent period when all threads are known to be idle.
+    - Under an application-level lock that prevents any thread from executing the
+      branch while the switch is in progress.
+
+    Reading the branch from multiple threads simultaneously (without any
+    concurrent write) is safe.
+  </Accordion>
+
+  <Accordion title="What happens if I forget to call init()?">
+    If `jmp::init()` is never called, the code pages containing branch sites
+    remain read-only (their default protection). Calling `operator=` to switch a
+    branch will attempt to write to a read-only code page, causing a **segfault
+    (SIGSEGV)**. The library does not check writability before patching.
+
+    Always call `init()` before any branch assignment and verify it succeeds:
+
+    ```cpp
+    int main() {
+      if (not jmp::init()) {
+        std::perror("jmp::init");
+        return errno;
+      }
+      // safe to assign branch values now
+    }
+    ```
+
+    <Note>
+      On some Linux configurations (e.g., kernels with strict `mprotect` policies
+      or certain security hardening options) making executable pages writable may
+      fail. `init()` returns `false` and sets `errno` in that case — always check
+      the return value.
+    </Note>
+  </Accordion>
+
+</AccordionGroup>

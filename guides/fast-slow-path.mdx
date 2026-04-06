@@ -1,0 +1,101 @@
+---
+title: "Fast/slow path"
+description: Use jmp::static_branch to make the hot path a nop and the cold path reachable only via a patched jmp.
+---
+
+The fast/slow path pattern is the most direct application of `jmp::static_branch`. The idea is simple: the hot path runs at full speed as a `nop` fall-through; the cold path is cold-sectioned and only reachable after a runtime code patch flips the instruction to a `jmp`.
+
+## The pattern
+
+```cpp
+[[gnu::always_inline]] inline void fast_path() { std::puts("fast_path"); }
+[[gnu::cold]] void slow_path() { std::puts("slow_path"); }
+
+constexpr jmp::static_branch<bool> disarmed = false;
+
+void trigger() {
+  if (not disarmed) { // { false: nop, true: jmp }
+    fast_path();
+  } else {
+    slow_path();
+  }
+}
+```
+
+### Reading the code
+
+- `disarmed = false` — the branch starts disarmed. The `if (not disarmed)` body is the fast path.
+- When `disarmed` is `false`, the condition evaluates as `not false` = `true`, so the fast path runs.
+- When `disarmed` is set to `true` at runtime (`disarmed = true`), the instruction at the call site is patched from `nop` to `jmp .Ltmp1`, routing execution to `slow_path`.
+
+The naming reflects the intent: while the branch is *disarmed*, the fast path is active. Arming the branch (setting `disarmed = true`) triggers the slow/diagnostic path.
+
+## Generated assembly
+
+```asm
+trigger(): // $CXX -O3
+  nop                              # code patching (nop->jmp .Ltmp1)
+ .Ltmp0:                           # fast path (inlined)
+  mov edi, OFFSET FLAT:.LC1
+  jmp puts
+ .Ltmp1:                           # slow path (cold)
+  jmp slow_path() # [clone .cold]
+```
+
+### What each part means
+
+| Label / instruction | Meaning |
+|---|---|
+| `nop` | The 5-byte NOP that will be overwritten with a `jmp` when `disarmed = true` is assigned. |
+| `.Ltmp0` | The fast path. `fast_path()` is inlined here — no call overhead. |
+| `.Ltmp1` | The slow path. Placed in a cold section by the linker; not in the instruction cache under normal operation. |
+| `jmp slow_path() [clone .cold]` | A tail-call to the cold-cloned slow path. Only reached after the nop is patched. |
+
+<Note>
+The fast path is always the fall-through. After the `nop` (or `jmp`), execution continues at `.Ltmp0`. The slow path at `.Ltmp1` is only ever reached when the `jmp` has been patched in — it lives in a cold section and does not pollute the instruction cache of the hot path.
+</Note>
+
+## The compiler attributes
+
+### `[[gnu::always_inline]]`
+
+Applying `[[gnu::always_inline]]` to `fast_path()` ensures the fast path body is inlined directly at `.Ltmp0`, eliminating a function call. The assembly confirms this: instead of `call fast_path`, you see the inlined `mov` + `jmp puts` sequence.
+
+Without this attribute the compiler might choose not to inline it, adding a call instruction to the hot path.
+
+### `[[gnu::cold]]`
+
+Applying `[[gnu::cold]]` to `slow_path()` tells the compiler and linker that this function is rarely called. The linker places cold functions in a separate section (`.text.unlikely` or similar), away from the hot instruction stream. This keeps the instruction cache clean for the common case.
+
+The assembly shows `jmp slow_path() [clone .cold]` — the `[clone .cold]` suffix confirms the function was placed in the cold section.
+
+## Practical applications
+
+<Steps>
+  <Step title="Circuit breakers">
+    A service can start with a circuit breaker disarmed (`disarmed = false`, fast path active). If downstream latency spikes, an operator sets `disarmed = true` to route requests through a fallback path — without restarting the process or recompiling.
+  </Step>
+  <Step title="Kill switches">
+    Ship experimental code behind a `static_branch` initialised to `false`. The feature runs at zero cost (a `nop`) until explicitly enabled. Disable it again instantly if it causes problems.
+  </Step>
+  <Step title="Feature flags">
+    Configuration-driven feature flags that are read once at startup. The flag value is committed into the instruction stream; subsequent checks cost nothing.
+  </Step>
+  <Step title="Debug probes">
+    Instrument hot loops with diagnostic code hidden behind a `static_branch<bool>`. In production the probe is a `nop`. Activate it at runtime to collect metrics without a redeployment.
+  </Step>
+</Steps>
+
+---
+
+<CardGroup cols={3}>
+  <Card title="Use cases" icon="lightbulb" href="/guides/use-cases">
+    When to reach for static_branch vs a plain bool.
+  </Card>
+  <Card title="Dispatching techniques" icon="code-branch" href="/guides/dispatching">
+    Compare all branch dispatch techniques side by side.
+  </Card>
+  <Card title="Variant with static dispatch" icon="layer-group" href="/guides/variant-example">
+    A full variant class built on static_branch.
+  </Card>
+</CardGroup>

@@ -1,0 +1,159 @@
+---
+title: "Variant with static dispatch"
+description: A complete variant<Ts...> class that uses static_branch as its active-type index, yielding direct jmp dispatch with no runtime type check.
+---
+
+This example shows how `jmp::static_branch<std::size_t, 0, sizeof...(Ts)>` can replace the integer active-type index inside a `variant`, turning every `visit` call into a single direct `jmp` with no conditional branch and no type-tag comparison.
+
+<Note>
+This example requires C++26 reflection (`std::meta`, `nonstatic_data_members_of`). Reflection is a preview feature available in recent experimental builds of Clang with `-freflection`. See [WG21 P2996](https://wg21.link/P2996) for the proposal status.
+</Note>
+
+## The variant class
+
+```cpp
+template<class... Ts>
+class variant {
+  static constexpr jmp::static_branch<std::size_t, 0, sizeof...(Ts)> index_ = 0u;
+
+ public:
+   constexpr variant() = default;
+
+   template<class T> requires (not std::is_base_of_v<variant, std::remove_cvref_t<T>>)
+   constexpr explicit(false) variant(T&& t) {
+    constexpr auto index = [] {
+      std::array match{std::is_same_v<Ts, std::remove_cvref_t<T>>...};
+      return std::ranges::find(match, true) - match.begin();
+    }();
+    index_ = index;
+    std::construct_at(&storage_.[:
+      nonstatic_data_members_of(^storage)[index + 1u]
+    :], std::forward<T>(t));
+   }
+   constexpr ~variant()
+    requires (std::is_trivially_destructible_v<Ts> and ...) = default;
+
+   template<class Fn>
+   constexpr auto visit(Fn&& fn) const -> decltype(auto) {
+    return [&]<auto I = 0u>(this auto&& self) {
+      if constexpr (I == sizeof...(Ts)) {
+        std::unreachable();
+      } else {
+        switch (index_) {
+          default: return self.template operator()<I + 1u>();
+          case I:  return std::invoke(std::forward<Fn>(fn), storage_.[:
+                            nonstatic_data_members_of(^storage)[I + 1u]
+                          :]);
+        }
+      }
+    }();
+  }
+
+private:
+  union storage;
+  struct empty{ };
+  static_assert(is_type(define_class(^storage, {
+    std::meta::data_member_spec(^empty, {.name = "empty"}),
+    std::meta::data_member_spec(^Ts)...
+  })));
+  storage storage_{.empty={}};
+};
+```
+
+## How the index works
+
+In a conventional `std::variant`, the active type is tracked by a runtime integer member (the discriminant). Every `visit` reads that integer, compares it against each case, and branches accordingly — even if the active type never changes.
+
+Here, `index_` is declared as:
+
+```cpp
+static constexpr jmp::static_branch<std::size_t, 0, sizeof...(Ts)> index_ = 0u;
+```
+
+- `static` — shared across all instances; there is one `index_` per specialisation of `variant<Ts...>`.
+- `constexpr` — initialised at compile time.
+- `static_branch<std::size_t, 0, sizeof...(Ts)>` — holds a value in the range `[0, sizeof...(Ts))`, representing the index of the active type.
+
+When the variant is assigned a new value (`v = 42`), two things happen:
+1. `index_ = index` patches the instruction stream so the next `visit` jumps directly to the matching case.
+2. `std::construct_at` places the new value into the correct union member via C++26 reflection.
+
+Because `index_` is `static`, the patch affects all instances that share the same `variant<Ts...>` specialisation simultaneously. This is intentional for the use cases where there is a single "mode" across the program.
+
+## Usage example
+
+```cpp
+void usage(const variant<bool, int, float>& v) {
+  v.visit(overload{
+    [](bool)  { std::puts("bool");  },
+    [](int)   { std::puts("int");   },
+    [](float) { std::puts("float"); },
+  });
+}
+
+int main() {
+  if (not jmp::init()) { // enables run-time code patching
+    return errno;
+  }
+
+  variant<bool, int, float> v{};
+
+  v = true;
+  usage(v);   // prints: bool
+
+  v = 42;
+  usage(v);   // prints: int
+
+  v = 42.f;
+  usage(v);   // prints: float
+}
+```
+
+## Generated assembly
+
+```asm
+usage(variant<bool, int, float> const&):
+  nop   # code patching (nop->jmp .Ltmp1|.Ltmp2)
+.Ltmp0:
+  mov edi, OFFSET FLAT:.LC0
+  jmp puts
+  ret
+.Ltmp1:
+  mov edi, OFFSET FLAT:.LC1
+  jmp puts
+  ret
+.Ltmp2:
+  mov edi, OFFSET FLAT:.LC2
+  jmp puts
+  ret
+
+.LC0: .asciz  "bool"
+.LC1: .asciz  "int"
+.LC2: .asciz  "float"
+```
+
+### Reading the assembly
+
+- The first instruction is either a 5-byte `nop` (when `index_` is `0`, i.e. `bool`) or a `jmp` to `.Ltmp1` or `.Ltmp2`.
+- Each case is a direct `jmp puts` — no virtual dispatch, no type-tag load, no comparison.
+- Assigning `v = 42` patches the `nop`/`jmp` at the top so subsequent calls to `usage` jump straight to `.Ltmp1`.
+
+The entire dispatch is a single unconditional jump (or nothing) regardless of how many types are in `Ts...` (within the `[2, 7]` range supported by `static_branch<T, Min, Max>`).
+
+<Tip>
+The same pattern works for any sum-type or tagged union where membership is fixed at compile time and the active member changes rarely at runtime. Examples include codec selection, serialiser format, allocator strategy, and logging backend — any situation where you have a small set of stable implementations and want dispatch to be as fast as a direct call.
+</Tip>
+
+---
+
+<CardGroup cols={3}>
+  <Card title="Use cases" icon="lightbulb" href="/guides/use-cases">
+    When to reach for static_branch vs a plain bool.
+  </Card>
+  <Card title="Fast/slow path" icon="gauge-high" href="/guides/fast-slow-path">
+    See the fast/slow path pattern with assembly walkthrough.
+  </Card>
+  <Card title="Dispatching techniques" icon="code-branch" href="/guides/dispatching">
+    Compare all branch dispatch techniques side by side.
+  </Card>
+</CardGroup>

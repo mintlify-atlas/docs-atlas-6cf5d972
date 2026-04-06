@@ -1,97 +1,61 @@
 ---
-title: "Introduction"
-description: "Welcome to the new home for your documentation"
+title: "jmp — Static Branch Library"
+description: "A C++20 single-header library for zero-overhead static branches via runtime code patching on x86-64 Linux."
 ---
 
-## Setting up
+`jmp` is a C++20 library that implements **static branches** — branches whose condition is stable at runtime and can be patched directly in machine code. Instead of a CPU branch or memory read on every call, `jmp` emits a single `nop` or `jmp` instruction that is rewritten in-place when the condition changes.
 
-Get your documentation site up and running in minutes.
+This technique is used in the Linux kernel under the name [static keys](https://docs.kernel.org/staging/static-keys.html) and is ideal for high-performance paths where branch misprediction or cache pressure is a bottleneck.
 
-<Card
-  title="Start here"
-  icon="rocket"
-  href="/quickstart"
-  horizontal
->
-  Follow our three step quickstart guide.
-</Card>
-
-## Make it yours
-
-Design a docs site that looks great and empowers your users.
-
-<Columns cols={2}>
-  <Card
-    title="Edit locally"
-    icon="pen-to-square"
-    href="/development"
-  >
-    Edit your docs locally and preview them in real time.
+<CardGroup cols={2}>
+  <Card title="Quickstart" icon="rocket" href="/quickstart">
+    Include the header, call `jmp::init()`, and use your first static branch in minutes.
   </Card>
-  <Card
-    title="Customize your site"
-    icon="palette"
-    href="/essentials/settings"
-  >
-    Customize the design and colors of your site to match your brand.
+  <Card title="How It Works" icon="microchip" href="/how-it-works">
+    Understand the code-patching technique behind `jmp::static_branch`.
   </Card>
-    <Card
-    title="Set up navigation"
-    icon="map"
-    href="/essentials/navigation"
-  >
-    Organize your docs to help users find what they need and succeed with your product.
+  <Card title="API Reference" icon="code" href="/reference/api">
+    Full reference for `static_branch<bool>`, `static_branch<T, Min, Max>`, and `init()`.
   </Card>
-  <Card
-    title="API documentation"
-    icon="terminal"
-    href="/api-reference/introduction"
-  >
-    Auto-generate API documentation from OpenAPI specifications.
+  <Card title="Guides" icon="book-open" href="/guides/use-cases">
+    Practical examples: fast/slow paths, dispatching, and variant devirtualization.
   </Card>
-</Columns>
+</CardGroup>
 
-## Create beautiful pages
+## Why `jmp`?
 
-Everything you need to create world-class documentation.
+Standard C++ branches — `if`, `switch`, ternary — require the CPU to evaluate a condition on every execution. When that condition is:
 
-<Columns cols={2}>
-  <Card
-    title="Write with MDX"
-    icon="pen-fancy"
-    href="/essentials/markdown"
-  >
-    Use MDX to style your docs pages.
-  </Card>
-  <Card
-    title="Code samples"
-    icon="code"
-    href="/essentials/code"
-  >
-    Add sample code to demonstrate how to use your product.
-  </Card>
-  <Card
-    title="Images"
-    icon="image"
-    href="/essentials/images"
-  >
-    Display images and other media.
-  </Card>
-  <Card
-    title="Reusable snippets"
-    icon="recycle"
-    href="/essentials/reusable-snippets"
-  >
-    Write once and reuse across your docs.
-  </Card>
-</Columns>
+- **Stable** — rarely changes through a program's lifetime
+- **Expensive** — requires a memory load or cache miss to evaluate
+- **Hard to predict** — confuses the branch predictor
 
-## Need inspiration?
+...the conventional approach wastes cycles. `jmp` solves this by replacing the branch with a single `nop` (no-operation) instruction when the condition is false, and patching it to a `jmp` when it becomes true. The CPU never needs to evaluate the condition again until it changes.
 
-<Card
-  title="See complete examples"
-  icon="stars"
-  href="https://mintlify.com/customers"
->
-  Browse our showcase of exceptional documentation sites.
-</Card>
+<Steps>
+  <Step title="Include the header">
+    Copy `jmp` (single header) or use the C++20 module `jmp.cppm` into your project. No build system changes required.
+  </Step>
+  <Step title="Declare a static branch">
+    ```cpp
+    constexpr jmp::static_branch<bool> logging_enabled = false;
+    ```
+  </Step>
+  <Step title="Enable code patching at startup">
+    ```cpp
+    if (not jmp::init()) { return errno; }
+    ```
+  </Step>
+  <Step title="Use and update the branch at runtime">
+    ```cpp
+    if (logging_enabled) { log("..."); }
+
+    // Later, switch it on — zero-cost from this point forward:
+    logging_enabled = true;
+    ```
+  </Step>
+</Steps>
+
+<Note>
+`jmp` currently supports **x86-64 Linux** with clang++ 10+ or g++ 10+. The technique is architecture-portable but only x86-64 is implemented.
+</Note>

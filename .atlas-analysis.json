@@ -1,23 +1,11 @@
 {
-  "$schema": "https://mintlify.com/docs.json",
-  "name": "jmp",
+  "projectType": "sdk-library",
+  "projectName": "jmp",
+  "projectDescription": "A C++20 single-header library providing zero-overhead static branches via runtime code patching on x86-64 Linux.",
   "theme": "luma",
-  "colors": {
-    "primary": "#94cb04",
-    "light": "#545454"
-  },
-  "favicon": "https://media.brand.dev/288cc7c4-5cef-4376-950b-bdf0083eedae.png",
-  "navbar": {
-    "primary": {
-      "type": "github",
-      "href": "https://github.com/qlibs/jmp"
-    }
-  },
-  "footer": {
-    "socials": {
-      "github": "https://github.com/qlibs/jmp"
-    }
-  },
+  "primaryColor": "#94cb04",
+  "lightColor": "#545454",
+  "darkColor": null,
   "navigation": {
     "tabs": [
       {
@@ -57,5 +45,19 @@
         ]
       }
     ]
-  }
+  },
+  "keyFeatures": [
+    "Zero-overhead static branches via runtime code patching (nop/jmp switching)",
+    "Single-header and C++20 module distribution",
+    "Support for bool and ranged integer static branches",
+    "Compile-time self-verification via static_assert tests",
+    "Based on the Linux kernel static-keys technique",
+    "Works with any function modifier: inline, noinline, constexpr"
+  ],
+  "publicApiSurface": [
+    "jmp::static_branch<bool>",
+    "jmp::static_branch<T, T Min, T Max>",
+    "jmp::init()",
+    "jmp::test()"
+  ]
 }

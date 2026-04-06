@@ -1,0 +1,84 @@
+---
+title: "Requirements"
+description: "System, compiler, and language requirements for building with jmp."
+---
+
+## Language
+
+C++20 or later is required. The library uses concepts, `constexpr` improvements, and `asm goto` label output operands that are only available in C++20-capable compilers.
+
+## Compilers
+
+| Compiler | Minimum version |
+|----------|-----------------|
+| clang++  | 10+             |
+| g++      | 10+             |
+
+Both compilers must have `asm goto` support, including the label output operand extension (`asm goto(...) : : : : label`). All versions of clang++ 10+ and g++ 10+ support this.
+
+## Architecture
+
+<Warning>
+  Only **x86-64** is supported. The code patching technique relies on x86-64
+  instruction encodings: a 5-byte multi-byte `nop` and a 5-byte near `jmp` with a
+  32-bit relative offset. The library will not compile or function correctly on
+  ARM, RISC-V, or other architectures.
+</Warning>
+
+## Operating system
+
+<Warning>
+  Only **Linux** is supported. The library uses the `__jmp` ELF section and calls
+  `mprotect` to make code pages writable. These are Linux-specific mechanisms.
+  macOS, Windows, and other operating systems are not supported.
+</Warning>
+
+## Dependencies
+
+`jmp` has no external library dependencies. It uses only two libc functions from `<unistd.h>` and `<sys/mman.h>`:
+
+- `getpagesize()` — to determine the system page size for `mprotect` alignment
+- `mprotect()` — to make code pages writable before patching
+
+Both are declared by the header itself using `extern "C"` and do not require any additional `#include` directives.
+
+## Compiler flags
+
+The only required flag is `-std=c++20`.
+
+```bash
+clang++ -std=c++20 -O2 main.cpp -o main
+# or
+g++ -std=c++20 -O2 main.cpp -o main
+```
+
+<Note>
+  `-O2` or higher is strongly recommended. Without optimisation, `asm goto` still
+  works and code patching is functional, but the branch site will not be reduced
+  to a single `nop` or `jmp` instruction — the optimizer is responsible for
+  emitting the compact inline form that makes static branches near-zero cost.
+</Note>
+
+Other flags commonly used alongside `jmp`:
+
+| Flag       | Effect |
+|------------|--------|
+| `-DNTEST`  | Disables automatic self-tests on include. See [FAQ](/reference/faq) for caveats. |
+| `-O3`      | Maximum optimisation; recommended for production hot paths. |
+| `-fno-inline` | Forces `noinline` behaviour; each branch site becomes a single `memcpy` rather than one per inlined copy. Useful for benchmarking switching cost. |
+
+## Single-header install
+
+`jmp` is a single-header library. Download it and place it anywhere on your include path:
+
+```bash
+curl -O https://raw.githubusercontent.com/qlibs/jmp/main/jmp
+```
+
+Then include it:
+
+```cpp
+#include "jmp"
+```
+
+A C++20 module interface unit is also available at `jmp.cppm` from the same repository for projects using C++20 modules.
